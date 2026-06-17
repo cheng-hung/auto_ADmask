@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Generate a first-pass detector bad-pixel mask from one TIFF image.
+"""Class-based detector bad-pixel mask generation.
 
-The workflow is intentionally dependency-light:
-  1. read a TIFF image with Pillow
-  2. make a percentile-clipped log-normalized intensity image
-  3. compute local median, local residual, and robust local z-score
-  4. threshold the local z-score to create a basic bad-pixel mask
+The generated mask uses 1 for bad/invalid pixels and 0 for good pixels.
+The class starts from a user-supplied baseline .npy mask, then can add:
+  1. invalid/non-finite pixels
+  2. local low/high outliers from a robust local z-score
+  3. an optional detector border mask
+  4. the existing optional beamstop detector
 
-The output mask uses 1 for bad/invalid pixels and 0 for good pixels.
+No files are written automatically. Import the class, tune parameters when calling
+``generate_mask()``, and save or inspect the returned array however you like.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
@@ -25,349 +27,527 @@ from PIL import Image
 TIFF_EXTENSIONS = {".tif", ".tiff", ".TIF", ".TIFF"}
 
 
-def find_first_tiff(folder: Path) -> Path:
-    candidates = sorted(
-        path for path in folder.iterdir() if path.is_file() and path.suffix in TIFF_EXTENSIONS
-    )
-    if not candidates:
-        raise FileNotFoundError(f"No TIFF files found in {folder}")
-    return candidates[0]
+class DetectorMaskGenerator:
+    """Generate detector masks from a TIFF image and a baseline .npy mask.
 
+    Parameters can be set at initialization and overridden per call to
+    ``generate_mask``. The final returned mask is a uint8 array with values
+    0 for good pixels and 1 for bad pixels.
+    """
 
-def read_tiff(path: Path, frame: int = 0) -> np.ndarray:
-    with Image.open(path) as image:
-        if frame:
-            image.seek(frame)
-        array = np.asarray(image, dtype=np.float32)
-    if array.ndim != 2:
-        raise ValueError(f"Expected a 2D detector image, got shape {array.shape}")
-    return array
-
-
-def finite_percentile(array: np.ndarray, q: float) -> float:
-    finite = array[np.isfinite(array)]
-    if finite.size == 0:
-        raise ValueError("Image contains no finite pixels")
-    return float(np.percentile(finite, q))
-
-
-def normalize_log_intensity(
-    image: np.ndarray,
-    low_percentile: float,
-    high_percentile: float,
-) -> tuple[np.ndarray, dict[str, float]]:
-    """Shift, log-scale, and normalize an image to approximately [0, 1]."""
-
-    finite = np.isfinite(image)
-    low = finite_percentile(image, low_percentile)
-
-    shifted = np.zeros_like(image, dtype=np.float32)
-    shifted[finite] = np.maximum(image[finite] - low, 0.0)
-    log_image = np.log1p(shifted, dtype=np.float32)
-
-    high = finite_percentile(log_image, high_percentile)
-    if high <= 0:
-        high = float(np.max(log_image[finite]))
-    if high <= 0:
-        raise ValueError("Could not find a positive normalization scale")
-
-    normalized = np.clip(log_image / high, 0.0, 1.0).astype(np.float32)
-    normalized[~finite] = np.nan
-
-    return normalized, {
-        "raw_low_percentile_value": low,
-        "log_high_percentile_value": high,
+    DEFAULTS: dict[str, Any] = {
+        "frame": 0,
+        "window": 7,
+        "tile_rows": 256,
+        "log_low_percentile": 0.5,
+        "log_high_percentile": 99.5,
+        "dead_z": -8.0,
+        "hot_z": 12.0,
+        "sigma_floor_percentile": 5.0,
+        "beamstop": "auto",
+        "beamstop_low_percentile": 3.0,
+        "beamstop_search_half_width": 120,
+        "beamstop_max_anchor_distance": 50,
+        "beamstop_min_run_width": 3,
+        "beamstop_max_run_width": 80,
+        "beamstop_padding": 8,
+        "beamstop_tip_radius_x": 24,
+        "beamstop_tip_radius_y": 32,
+        "border": 10,
+        "dilate": 0,
     }
 
+    def __init__(
+        self,
+        tiff_file: str | Path,
+        basic_mask_npy: str | Path,
+        **parameters: Any,
+    ) -> None:
+        unknown = sorted(set(parameters) - set(self.DEFAULTS))
+        if unknown:
+            raise ValueError(f"Unknown parameter(s): {', '.join(unknown)}")
 
-def median_filter_tiled(array: np.ndarray, window: int, tile_rows: int) -> np.ndarray:
-    """Median filter using reflected edges and row tiles to limit memory use."""
+        self.tiff_file = Path(tiff_file).resolve()
+        self.basic_mask_npy = Path(basic_mask_npy).resolve()
+        self.parameters = {**self.DEFAULTS, **parameters}
 
-    if window % 2 != 1 or window < 3:
-        raise ValueError("--window must be an odd integer >= 3")
+        self.raw = self.read_tiff(self.tiff_file, frame=int(self.parameters["frame"]))
+        self.finite = np.isfinite(self.raw)
+        self.basic_mask = self.load_basic_mask(self.basic_mask_npy, expected_shape=self.raw.shape)
 
-    pad = window // 2
-    height, width = array.shape
-    out = np.empty_like(array, dtype=np.float32)
+        self.log_normalized: np.ndarray | None = None
+        self.local_median: np.ndarray | None = None
+        self.local_residual: np.ndarray | None = None
+        self.local_zscore: np.ndarray | None = None
+        self.invalid_mask: np.ndarray | None = None
+        self.dead_mask: np.ndarray | None = None
+        self.hot_mask: np.ndarray | None = None
+        self.beamstop_mask: np.ndarray | None = None
+        self.final_mask: np.ndarray | None = None
+        self.summary: dict[str, Any] = {}
 
-    finite = np.isfinite(array)
-    fill_value = float(np.median(array[finite])) if finite.any() else 0.0
-    clean = np.where(finite, array, fill_value).astype(np.float32, copy=False)
-    padded = np.pad(clean, pad_width=pad, mode="reflect")
+    @staticmethod
+    def find_first_tiff(folder: str | Path = ".") -> Path:
+        folder = Path(folder)
+        candidates = sorted(
+            path for path in folder.iterdir() if path.is_file() and path.suffix in TIFF_EXTENSIONS
+        )
+        if not candidates:
+            raise FileNotFoundError(f"No TIFF files found in {folder}")
+        return candidates[0]
 
-    for row0 in range(0, height, tile_rows):
-        row1 = min(row0 + tile_rows, height)
-        block = padded[row0 : row1 + 2 * pad, :]
-        windows = sliding_window_view(block, (window, window))
-        out[row0:row1, :] = np.median(windows, axis=(-2, -1)).astype(np.float32)
+    @staticmethod
+    def read_tiff(path: str | Path, frame: int = 0) -> np.ndarray:
+        with Image.open(path) as image:
+            if frame:
+                image.seek(frame)
+            array = np.asarray(image, dtype=np.float32)
+        if array.ndim != 2:
+            raise ValueError(f"Expected a 2D detector image, got shape {array.shape}")
+        return array
 
-    return out
+    @staticmethod
+    def load_basic_mask(path: str | Path, expected_shape: tuple[int, int]) -> np.ndarray:
+        mask = np.load(path)
+        if mask.shape != expected_shape:
+            raise ValueError(
+                f"Basic mask shape {mask.shape} does not match detector image shape {expected_shape}"
+            )
+        return mask.astype(bool)
 
+    @staticmethod
+    def finite_percentile(array: np.ndarray, q: float) -> float:
+        finite = array[np.isfinite(array)]
+        if finite.size == 0:
+            raise ValueError("Image contains no finite pixels")
+        return float(np.percentile(finite, q))
 
-def robust_local_zscore(
-    analysis_image: np.ndarray,
-    window: int,
-    tile_rows: int,
-    sigma_floor_percentile: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
-    local_median = median_filter_tiled(analysis_image, window, tile_rows)
-    residual = analysis_image - local_median
+    def normalize_log_intensity(
+        self,
+        image: np.ndarray,
+        low_percentile: float,
+        high_percentile: float,
+    ) -> tuple[np.ndarray, dict[str, float]]:
+        finite = np.isfinite(image)
+        low = self.finite_percentile(image, low_percentile)
 
-    abs_residual = np.abs(residual)
-    local_mad = median_filter_tiled(abs_residual, window, tile_rows)
-    robust_sigma = (1.4826 * local_mad).astype(np.float32)
+        shifted = np.zeros_like(image, dtype=np.float32)
+        shifted[finite] = np.maximum(image[finite] - low, 0.0)
+        log_image = np.log1p(shifted, dtype=np.float32)
 
-    positive_sigma = robust_sigma[np.isfinite(robust_sigma) & (robust_sigma > 0)]
-    if positive_sigma.size:
-        sigma_floor = float(np.percentile(positive_sigma, sigma_floor_percentile))
-    else:
-        sigma_floor = 1.0e-6
-    sigma_floor = max(sigma_floor, 1.0e-6)
+        high = self.finite_percentile(log_image, high_percentile)
+        if high <= 0:
+            high = float(np.max(log_image[finite]))
+        if high <= 0:
+            raise ValueError("Could not find a positive normalization scale")
 
-    zscore = residual / np.maximum(robust_sigma, sigma_floor)
-    zscore = zscore.astype(np.float32)
-    return local_median, residual.astype(np.float32), zscore, sigma_floor
+        normalized = np.clip(log_image / high, 0.0, 1.0).astype(np.float32)
+        normalized[~finite] = np.nan
+        return normalized, {
+            "raw_low_percentile_value": low,
+            "log_high_percentile_value": high,
+        }
 
+    def median_filter_tiled(self, array: np.ndarray, window: int, tile_rows: int) -> np.ndarray:
+        if window % 2 != 1 or window < 3:
+            raise ValueError("window must be an odd integer >= 3")
 
-def binary_dilate(mask: np.ndarray, iterations: int) -> np.ndarray:
-    result = mask.astype(bool, copy=True)
-    for _ in range(iterations):
-        padded = np.pad(result, 1, mode="constant", constant_values=False)
-        expanded = np.zeros_like(result, dtype=bool)
-        for dy in range(3):
-            for dx in range(3):
-                expanded |= padded[dy : dy + result.shape[0], dx : dx + result.shape[1]]
-        result = expanded
-    return result
+        pad = window // 2
+        height, _width = array.shape
+        out = np.empty_like(array, dtype=np.float32)
 
+        finite = np.isfinite(array)
+        fill_value = float(np.median(array[finite])) if finite.any() else 0.0
+        clean = np.where(finite, array, fill_value).astype(np.float32, copy=False)
+        padded = np.pad(clean, pad_width=pad, mode="reflect")
 
-def save_mask_tiff(mask: np.ndarray, path: Path) -> None:
-    Image.fromarray(mask.astype(np.uint8)).save(path)
+        for row0 in range(0, height, tile_rows):
+            row1 = min(row0 + tile_rows, height)
+            block = padded[row0 : row1 + 2 * pad, :]
+            windows = sliding_window_view(block, (window, window))
+            out[row0:row1, :] = np.median(windows, axis=(-2, -1)).astype(np.float32)
 
+        return out
 
-def as_uint8_grayscale(array: np.ndarray, low_q: float = 0.5, high_q: float = 99.5) -> np.ndarray:
-    finite = np.isfinite(array)
-    low = float(np.percentile(array[finite], low_q))
-    high = float(np.percentile(array[finite], high_q))
-    if high <= low:
-        high = low + 1.0
-    scaled = np.clip((array - low) / (high - low), 0.0, 1.0)
-    scaled[~finite] = 0.0
-    return (255.0 * scaled).astype(np.uint8)
+    def robust_local_zscore(
+        self,
+        analysis_image: np.ndarray,
+        window: int,
+        tile_rows: int,
+        sigma_floor_percentile: float,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+        local_median = self.median_filter_tiled(analysis_image, window, tile_rows)
+        residual = analysis_image - local_median
 
+        abs_residual = np.abs(residual)
+        local_mad = self.median_filter_tiled(abs_residual, window, tile_rows)
+        robust_sigma = (1.4826 * local_mad).astype(np.float32)
 
-def save_grayscale_preview(array: np.ndarray, path: Path) -> None:
-    Image.fromarray(as_uint8_grayscale(array)).save(path)
+        positive_sigma = robust_sigma[np.isfinite(robust_sigma) & (robust_sigma > 0)]
+        if positive_sigma.size:
+            sigma_floor = float(np.percentile(positive_sigma, sigma_floor_percentile))
+        else:
+            sigma_floor = 1.0e-6
+        sigma_floor = max(sigma_floor, 1.0e-6)
 
+        zscore = residual / np.maximum(robust_sigma, sigma_floor)
+        return local_median, residual.astype(np.float32), zscore.astype(np.float32), sigma_floor
 
-def save_diverging_preview(array: np.ndarray, path: Path, percentile: float = 99.0) -> None:
-    finite = np.isfinite(array)
-    scale = float(np.percentile(np.abs(array[finite]), percentile))
-    if scale <= 0:
-        scale = 1.0
+    @staticmethod
+    def binary_dilate(mask: np.ndarray, iterations: int) -> np.ndarray:
+        result = mask.astype(bool, copy=True)
+        for _ in range(iterations):
+            padded = np.pad(result, 1, mode="constant", constant_values=False)
+            expanded = np.zeros_like(result, dtype=bool)
+            for dy in range(3):
+                for dx in range(3):
+                    expanded |= padded[dy : dy + result.shape[0], dx : dx + result.shape[1]]
+            result = expanded
+        return result
 
-    normalized = np.clip(array / scale, -1.0, 1.0)
-    normalized[~finite] = 0.0
-    magnitude = np.abs(normalized)
-    base = 255.0 * (1.0 - magnitude)
+    def detect_beamstop_mask(
+        self,
+        analysis_image: np.ndarray,
+        finite: np.ndarray,
+        low_percentile: float,
+        search_half_width: int,
+        max_anchor_distance: int,
+        min_run_width: int,
+        max_run_width: int,
+        padding: int,
+        tip_radius_x: int,
+        tip_radius_y: int,
+        border: int,
+    ) -> tuple[np.ndarray, dict[str, int | float | bool | None]]:
+        """Keep the existing vertical low-response beamstop detector available."""
 
-    red = base + 255.0 * np.clip(normalized, 0.0, 1.0)
-    green = base
-    blue = base + 255.0 * np.clip(-normalized, 0.0, 1.0)
-    rgb = np.stack([red, green, blue], axis=-1).clip(0, 255).astype(np.uint8)
-    Image.fromarray(rgb).save(path)
+        height, width = analysis_image.shape
+        mask = np.zeros_like(finite, dtype=bool)
+        details: dict[str, int | float | bool | None] = {
+            "beamstop_detected": False,
+            "beamstop_center_col": None,
+            "beamstop_top_row": None,
+            "beamstop_bottom_row": None,
+            "beamstop_low_threshold": None,
+            "beamstop_candidate_rows": 0,
+            "beamstop_stripe_half_width": None,
+        }
 
+        if not finite.any():
+            return mask, details
 
-def save_mask_overlay(base_image: np.ndarray, mask: np.ndarray, path: Path) -> None:
-    gray = as_uint8_grayscale(base_image)
-    rgb = np.repeat(gray[:, :, None], 3, axis=2)
-    red = np.array([255, 0, 0], dtype=np.uint8)
-    rgb[mask] = (0.35 * rgb[mask] + 0.65 * red).astype(np.uint8)
-    Image.fromarray(rgb).save(path)
+        low_threshold = self.finite_percentile(analysis_image, low_percentile)
+        low_mask = finite & (analysis_image <= low_threshold)
 
+        lower_row0 = max(int(0.45 * height), border)
+        lower_row1 = max(lower_row0, height - border)
+        central_col0 = int(0.25 * width)
+        central_col1 = int(0.75 * width)
+        if lower_row1 <= lower_row0 or central_col1 <= central_col0:
+            return mask, details
 
-def write_summary(path: Path, summary: dict) -> None:
-    path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        column_scores = low_mask[lower_row0:lower_row1, central_col0:central_col1].sum(axis=0)
+        if column_scores.size == 0:
+            return mask, details
+
+        smooth_window = min(15, column_scores.size)
+        smoothed_scores = np.convolve(column_scores, np.ones(smooth_window), mode="same")
+        center_col = central_col0 + int(np.argmax(smoothed_scores))
+        peak_score = int(column_scores[center_col - central_col0])
+        min_peak_score = max(25, int(0.05 * (lower_row1 - lower_row0)))
+        if peak_score < min_peak_score:
+            details.update(
+                {
+                    "beamstop_center_col": center_col,
+                    "beamstop_low_threshold": low_threshold,
+                }
+            )
+            return mask, details
+
+        row0 = max(int(0.35 * height), border)
+        row1 = max(row0, height - border)
+        search_col0 = max(0, center_col - search_half_width)
+        search_col1 = min(width, center_col + search_half_width + 1)
+        row_extents: list[tuple[int, int, int, int]] = []
+
+        for row in range(row0, row1):
+            low_cols = np.flatnonzero(low_mask[row, search_col0:search_col1])
+            if low_cols.size == 0:
+                continue
+
+            low_cols = low_cols + search_col0
+            anchor_col = int(low_cols[np.argmin(np.abs(low_cols - center_col))])
+            if abs(anchor_col - center_col) > max_anchor_distance:
+                continue
+
+            left = anchor_col
+            right = anchor_col
+            while left - 1 >= 0 and low_mask[row, left - 1]:
+                left -= 1
+            while right + 1 < width and low_mask[row, right + 1]:
+                right += 1
+
+            run_width = right - left + 1
+            if min_run_width <= run_width <= max_run_width:
+                mask[row, max(0, left - padding) : min(width, right + padding + 1)] = True
+                row_extents.append((row, left, right, run_width))
+
+        if not row_extents:
+            details.update(
+                {
+                    "beamstop_center_col": center_col,
+                    "beamstop_low_threshold": low_threshold,
+                }
+            )
+            return mask, details
+
+        top_row = min(extent[0] for extent in row_extents)
+        bottom_row = max(extent[0] for extent in row_extents)
+        run_widths = np.array([extent[3] for extent in row_extents], dtype=np.float32)
+        stripe_half_width = int(np.ceil(np.percentile(run_widths, 95) / 2.0)) + padding
+        mask[
+            top_row : bottom_row + 1,
+            max(0, center_col - stripe_half_width) : min(width, center_col + stripe_half_width + 1),
+        ] = True
+        if tip_radius_x > 0 and tip_radius_y > 0:
+            yy, xx = np.ogrid[:height, :width]
+            tip = ((xx - center_col) / tip_radius_x) ** 2 + ((yy - top_row) / tip_radius_y) ** 2 <= 1
+            mask |= tip
+
+        details.update(
+            {
+                "beamstop_detected": True,
+                "beamstop_center_col": center_col,
+                "beamstop_top_row": top_row,
+                "beamstop_bottom_row": bottom_row,
+                "beamstop_low_threshold": low_threshold,
+                "beamstop_candidate_rows": len(row_extents),
+                "beamstop_stripe_half_width": stripe_half_width,
+            }
+        )
+        return mask, details
+
+    def _merged_parameters(self, overrides: dict[str, Any]) -> dict[str, Any]:
+        unknown = sorted(set(overrides) - set(self.DEFAULTS))
+        if unknown:
+            raise ValueError(f"Unknown parameter(s): {', '.join(unknown)}")
+        return {**self.parameters, **overrides}
+
+    def generate_mask(self, **parameter_overrides: Any) -> np.ndarray:
+        """Generate and return the final uint8 mask without saving files.
+
+        Example:
+            generator = DetectorMaskGenerator("image.tiff", "basic_mask.npy", border=10)
+            mask = generator.generate_mask(dead_z=-10, hot_z=15, beamstop="off")
+        """
+
+        params = self._merged_parameters(parameter_overrides)
+        beamstop_mode = params["beamstop"]
+        if beamstop_mode not in {"auto", "off"}:
+            raise ValueError("beamstop must be 'auto' or 'off'")
+
+        log_normalized, log_info = self.normalize_log_intensity(
+            self.raw,
+            low_percentile=float(params["log_low_percentile"]),
+            high_percentile=float(params["log_high_percentile"]),
+        )
+        local_median, local_residual, local_zscore, sigma_floor = self.robust_local_zscore(
+            log_normalized,
+            window=int(params["window"]),
+            tile_rows=int(params["tile_rows"]),
+            sigma_floor_percentile=float(params["sigma_floor_percentile"]),
+        )
+
+        invalid_mask = ~self.finite
+        dead_mask = self.finite & (local_zscore <= float(params["dead_z"]))
+        hot_mask = self.finite & (local_zscore >= float(params["hot_z"]))
+        beamstop_mask = np.zeros_like(self.finite, dtype=bool)
+        beamstop_info: dict[str, int | float | bool | None] = {
+            "beamstop_detected": False,
+            "beamstop_center_col": None,
+            "beamstop_top_row": None,
+            "beamstop_bottom_row": None,
+            "beamstop_low_threshold": None,
+            "beamstop_candidate_rows": 0,
+            "beamstop_stripe_half_width": None,
+        }
+
+        if beamstop_mode == "auto":
+            beamstop_mask, beamstop_info = self.detect_beamstop_mask(
+                log_normalized,
+                finite=self.finite,
+                low_percentile=float(params["beamstop_low_percentile"]),
+                search_half_width=int(params["beamstop_search_half_width"]),
+                max_anchor_distance=int(params["beamstop_max_anchor_distance"]),
+                min_run_width=int(params["beamstop_min_run_width"]),
+                max_run_width=int(params["beamstop_max_run_width"]),
+                padding=int(params["beamstop_padding"]),
+                tip_radius_x=int(params["beamstop_tip_radius_x"]),
+                tip_radius_y=int(params["beamstop_tip_radius_y"]),
+                border=int(params["border"]),
+            )
+
+        final_mask_bool = self.basic_mask | invalid_mask | dead_mask | hot_mask | beamstop_mask
+
+        border = int(params["border"])
+        if border > 0:
+            final_mask_bool[:border, :] = True
+            final_mask_bool[-border:, :] = True
+            final_mask_bool[:, :border] = True
+            final_mask_bool[:, -border:] = True
+
+        dilate = int(params["dilate"])
+        if dilate > 0:
+            final_mask_bool = self.binary_dilate(final_mask_bool, dilate)
+
+        self.log_normalized = log_normalized
+        self.local_median = local_median
+        self.local_residual = local_residual
+        self.local_zscore = local_zscore
+        self.invalid_mask = invalid_mask
+        self.dead_mask = dead_mask
+        self.hot_mask = hot_mask
+        self.beamstop_mask = beamstop_mask
+        self.final_mask = final_mask_bool.astype(np.uint8)
+
+        finite_raw = self.raw[self.finite]
+        bad_count = int(self.final_mask.sum())
+        total_count = int(self.final_mask.size)
+        self.summary = {
+            "input_image": str(self.tiff_file),
+            "basic_mask_npy": str(self.basic_mask_npy),
+            "shape": list(self.raw.shape),
+            "dtype_after_read": str(self.raw.dtype),
+            "raw_min": float(np.min(finite_raw)),
+            "raw_max": float(np.max(finite_raw)),
+            "raw_mean": float(np.mean(finite_raw)),
+            "raw_median": float(np.median(finite_raw)),
+            "log_low_percentile": float(params["log_low_percentile"]),
+            "log_high_percentile": float(params["log_high_percentile"]),
+            **log_info,
+            "local_window": int(params["window"]),
+            "dead_z_threshold": float(params["dead_z"]),
+            "hot_z_threshold": float(params["hot_z"]),
+            "sigma_floor": sigma_floor,
+            "dilate_iterations": dilate,
+            "border_pixels_marked_bad": border,
+            "basic_mask_count": int(self.basic_mask.sum()),
+            "invalid_pixel_count": int(invalid_mask.sum()),
+            "dead_candidate_count": int(dead_mask.sum()),
+            "hot_candidate_count": int(hot_mask.sum()),
+            "beamstop_mode": beamstop_mode,
+            "beamstop_candidate_count": int(beamstop_mask.sum()),
+            **beamstop_info,
+            "bad_pixel_count": bad_count,
+            "total_pixel_count": total_count,
+            "bad_pixel_fraction": bad_count / total_count,
+        }
+        return self.final_mask
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build a statistical bad-pixel mask from a detector TIFF image."
+        description="Generate an in-memory detector mask from a TIFF and baseline .npy mask."
     )
-    parser.add_argument(
-        "image",
-        nargs="?",
-        type=Path,
-        help="Input TIFF file. If omitted, the first TIFF in the current folder is used.",
-    )
-    parser.add_argument("--frame", type=int, default=0, help="Frame index for multi-page TIFFs.")
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=Path("mask_baseline_output"),
-        help="Directory for masks, arrays, and previews.",
-    )
-    parser.add_argument(
-        "--window",
-        type=int,
-        default=7,
-        help="Odd local neighborhood size for median/MAD calculations.",
-    )
-    parser.add_argument(
-        "--tile-rows",
-        type=int,
-        default=256,
-        help="Rows processed at once during tiled median filtering.",
-    )
+    parser.add_argument("image", type=Path, help="Input TIFF detector image.")
+    parser.add_argument("basic_mask", type=Path, help="Input baseline .npy mask, 0=good and nonzero=bad.")
+    parser.add_argument("--frame", type=int, default=DetectorMaskGenerator.DEFAULTS["frame"])
+    parser.add_argument("--window", type=int, default=DetectorMaskGenerator.DEFAULTS["window"])
+    parser.add_argument("--tile-rows", type=int, default=DetectorMaskGenerator.DEFAULTS["tile_rows"])
     parser.add_argument(
         "--log-low-percentile",
         type=float,
-        default=0.5,
-        help="Raw intensity percentile used as the zero point before log scaling.",
+        default=DetectorMaskGenerator.DEFAULTS["log_low_percentile"],
     )
     parser.add_argument(
         "--log-high-percentile",
         type=float,
-        default=99.5,
-        help="Log intensity percentile mapped to 1.0 after log scaling.",
+        default=DetectorMaskGenerator.DEFAULTS["log_high_percentile"],
     )
-    parser.add_argument(
-        "--dead-z",
-        type=float,
-        default=-8.0,
-        help="Pixels with local z-score <= this value are marked bad.",
-    )
-    parser.add_argument(
-        "--hot-z",
-        type=float,
-        default=12.0,
-        help="Pixels with local z-score >= this value are marked bad.",
-    )
+    parser.add_argument("--dead-z", type=float, default=DetectorMaskGenerator.DEFAULTS["dead_z"])
+    parser.add_argument("--hot-z", type=float, default=DetectorMaskGenerator.DEFAULTS["hot_z"])
     parser.add_argument(
         "--sigma-floor-percentile",
         type=float,
-        default=5.0,
-        help="Percentile floor for local robust sigma to avoid division by tiny noise.",
+        default=DetectorMaskGenerator.DEFAULTS["sigma_floor_percentile"],
     )
     parser.add_argument(
-        "--dilate",
-        type=int,
-        default=0,
-        help="Optional dilation iterations applied to the final mask.",
+        "--beamstop",
+        choices=("auto", "off"),
+        default=DetectorMaskGenerator.DEFAULTS["beamstop"],
     )
     parser.add_argument(
-        "--border",
-        type=int,
-        default=0,
-        help="Optional border width, in pixels, always marked bad.",
+        "--beamstop-low-percentile",
+        type=float,
+        default=DetectorMaskGenerator.DEFAULTS["beamstop_low_percentile"],
     )
+    parser.add_argument(
+        "--beamstop-search-half-width",
+        type=int,
+        default=DetectorMaskGenerator.DEFAULTS["beamstop_search_half_width"],
+    )
+    parser.add_argument(
+        "--beamstop-max-anchor-distance",
+        type=int,
+        default=DetectorMaskGenerator.DEFAULTS["beamstop_max_anchor_distance"],
+    )
+    parser.add_argument(
+        "--beamstop-min-run-width",
+        type=int,
+        default=DetectorMaskGenerator.DEFAULTS["beamstop_min_run_width"],
+    )
+    parser.add_argument(
+        "--beamstop-max-run-width",
+        type=int,
+        default=DetectorMaskGenerator.DEFAULTS["beamstop_max_run_width"],
+    )
+    parser.add_argument(
+        "--beamstop-padding",
+        type=int,
+        default=DetectorMaskGenerator.DEFAULTS["beamstop_padding"],
+    )
+    parser.add_argument(
+        "--beamstop-tip-radius-x",
+        type=int,
+        default=DetectorMaskGenerator.DEFAULTS["beamstop_tip_radius_x"],
+    )
+    parser.add_argument(
+        "--beamstop-tip-radius-y",
+        type=int,
+        default=DetectorMaskGenerator.DEFAULTS["beamstop_tip_radius_y"],
+    )
+    parser.add_argument("--border", type=int, default=DetectorMaskGenerator.DEFAULTS["border"])
+    parser.add_argument("--dilate", type=int, default=DetectorMaskGenerator.DEFAULTS["dilate"])
     return parser.parse_args(argv)
 
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
-    image_path = args.image if args.image is not None else find_first_tiff(Path.cwd())
-    image_path = image_path.resolve()
-    output_dir = args.output_dir.resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    raw = read_tiff(image_path, frame=args.frame)
-    finite = np.isfinite(raw)
-
-    log_normalized, log_info = normalize_log_intensity(
-        raw,
-        low_percentile=args.log_low_percentile,
-        high_percentile=args.log_high_percentile,
-    )
-
-    local_median, local_residual, local_zscore, sigma_floor = robust_local_zscore(
-        log_normalized,
+    generator = DetectorMaskGenerator(
+        args.image,
+        args.basic_mask,
+        frame=args.frame,
         window=args.window,
         tile_rows=args.tile_rows,
+        log_low_percentile=args.log_low_percentile,
+        log_high_percentile=args.log_high_percentile,
+        dead_z=args.dead_z,
+        hot_z=args.hot_z,
         sigma_floor_percentile=args.sigma_floor_percentile,
+        beamstop=args.beamstop,
+        beamstop_low_percentile=args.beamstop_low_percentile,
+        beamstop_search_half_width=args.beamstop_search_half_width,
+        beamstop_max_anchor_distance=args.beamstop_max_anchor_distance,
+        beamstop_min_run_width=args.beamstop_min_run_width,
+        beamstop_max_run_width=args.beamstop_max_run_width,
+        beamstop_padding=args.beamstop_padding,
+        beamstop_tip_radius_x=args.beamstop_tip_radius_x,
+        beamstop_tip_radius_y=args.beamstop_tip_radius_y,
+        border=args.border,
+        dilate=args.dilate,
     )
-
-    invalid_mask = ~finite
-    dead_mask = finite & (local_zscore <= args.dead_z)
-    hot_mask = finite & (local_zscore >= args.hot_z)
-    mask = invalid_mask | dead_mask | hot_mask
-
-    if args.border > 0:
-        b = args.border
-        mask[:b, :] = True
-        mask[-b:, :] = True
-        mask[:, :b] = True
-        mask[:, -b:] = True
-
-    if args.dilate > 0:
-        mask = binary_dilate(mask, args.dilate)
-
-    stem = image_path.stem
-    mask_path = output_dir / f"{stem}_basic_bad_pixel_mask.tiff"
-    dead_mask_path = output_dir / f"{stem}_dead_candidate_mask.tiff"
-    hot_mask_path = output_dir / f"{stem}_hot_candidate_mask.tiff"
-    log_path = output_dir / f"{stem}_log_normalized.npy"
-    median_path = output_dir / f"{stem}_local_median.npy"
-    residual_path = output_dir / f"{stem}_local_residual.npy"
-    zscore_path = output_dir / f"{stem}_local_zscore.npy"
-    summary_path = output_dir / f"{stem}_summary.json"
-
-    save_mask_tiff(mask, mask_path)
-    save_mask_tiff(dead_mask, dead_mask_path)
-    save_mask_tiff(hot_mask, hot_mask_path)
-    np.save(log_path, log_normalized)
-    np.save(median_path, local_median)
-    np.save(residual_path, local_residual)
-    np.save(zscore_path, local_zscore)
-
-    save_grayscale_preview(log_normalized, output_dir / f"{stem}_preview_log_normalized.png")
-    save_grayscale_preview(local_median, output_dir / f"{stem}_preview_local_median.png")
-    save_diverging_preview(local_residual, output_dir / f"{stem}_preview_local_residual.png")
-    save_diverging_preview(local_zscore, output_dir / f"{stem}_preview_local_zscore.png")
-    save_mask_overlay(log_normalized, mask, output_dir / f"{stem}_preview_mask_overlay.png")
-
-    finite_raw = raw[finite]
-    bad_count = int(mask.sum())
-    total_count = int(mask.size)
-    summary = {
-        "input_image": str(image_path),
-        "shape": list(raw.shape),
-        "dtype_after_read": str(raw.dtype),
-        "raw_min": float(np.min(finite_raw)),
-        "raw_max": float(np.max(finite_raw)),
-        "raw_mean": float(np.mean(finite_raw)),
-        "raw_median": float(np.median(finite_raw)),
-        "log_low_percentile": args.log_low_percentile,
-        "log_high_percentile": args.log_high_percentile,
-        **log_info,
-        "local_window": args.window,
-        "dead_z_threshold": args.dead_z,
-        "hot_z_threshold": args.hot_z,
-        "sigma_floor": sigma_floor,
-        "dilate_iterations": args.dilate,
-        "border_pixels_marked_bad": args.border,
-        "invalid_pixel_count": int(invalid_mask.sum()),
-        "dead_candidate_count_before_dilation_or_border": int(dead_mask.sum()),
-        "hot_candidate_count_before_dilation_or_border": int(hot_mask.sum()),
-        "bad_pixel_count": bad_count,
-        "total_pixel_count": total_count,
-        "bad_pixel_fraction": bad_count / total_count,
-        "outputs": {
-            "mask_tiff": str(mask_path),
-            "dead_candidate_mask_tiff": str(dead_mask_path),
-            "hot_candidate_mask_tiff": str(hot_mask_path),
-            "log_normalized_npy": str(log_path),
-            "local_median_npy": str(median_path),
-            "local_residual_npy": str(residual_path),
-            "local_zscore_npy": str(zscore_path),
-        },
-    }
-    write_summary(summary_path, summary)
-
-    print(f"Input: {image_path}")
-    print(f"Mask: {mask_path}")
-    print(f"Bad pixels: {bad_count} / {total_count} ({100.0 * bad_count / total_count:.4f}%)")
-    print(f"Summary: {summary_path}")
+    generator.generate_mask()
+    print(json.dumps(generator.summary, indent=2))
     return 0
 
 

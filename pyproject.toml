@@ -1,0 +1,27 @@
+[project]
+name = "auto-admask"
+version = "0.1.0"
+description = "Tools for automatic area-detector mask generation."
+requires-python = ">=3.10"
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["osx-arm64"]
+
+[tool.pixi.dependencies]
+python = ">=3.10"
+ipython = "*"
+jupyterlab = "*"
+matplotlib = "*"
+numpy = "*"
+pandas = "*"
+pillow = "*"
+scipy = "*"
+
+[tool.pixi.tasks]
+ipython = "ipython"
+lab = "jupyter lab"
+mask = "python generate_basic_mask.py"
+
+[tool.pixi.environments]
+terminal = { features = [], solve-group = "default" }

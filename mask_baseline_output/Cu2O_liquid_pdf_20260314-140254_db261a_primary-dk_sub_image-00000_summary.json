@@ -1,5 +1,5 @@
 {
-  "input_image": "/Users/cheng-hunglin/Documents/codex_projects/Cu2O_liquid_pdf_20260314-140254_db261a_primary-dk_sub_image-00000.tiff",
+  "input_image": "/Users/cheng-hunglin/Documents/Codex/auto_ADmask/Cu2O_liquid_pdf_20260314-140254_db261a_primary-dk_sub_image-00000.tiff",
   "shape": [
     2048,
     2048
@@ -18,20 +18,23 @@
   "hot_z_threshold": 12.0,
   "sigma_floor": 0.0001943252864293754,
   "dilate_iterations": 0,
-  "border_pixels_marked_bad": 0,
+  "border_pixels_marked_bad": 10,
   "invalid_pixel_count": 0,
   "dead_candidate_count_before_dilation_or_border": 9297,
   "hot_candidate_count_before_dilation_or_border": 581,
-  "bad_pixel_count": 9878,
+  "beamstop_mode": "auto",
+  "beamstop_candidate_count_before_dilation_or_border": 44655,
+  "beamstop_detected": true,
+  "beamstop_center_col": 1021,
+  "beamstop_top_row": 1039,
+  "beamstop_bottom_row": 2037,
+  "beamstop_low_threshold": 0.59063720703125,
+  "beamstop_candidate_rows": 938,
+  "beamstop_stripe_half_width": 21,
+  "bad_pixel_count": 129225,
   "total_pixel_count": 4194304,
-  "bad_pixel_fraction": 0.0023550987243652344,
+  "bad_pixel_fraction": 0.030809640884399414,
   "outputs": {
-    "mask_tiff": "/Users/cheng-hunglin/Documents/codex_projects/mask_baseline_output/Cu2O_liquid_pdf_20260314-140254_db261a_primary-dk_sub_image-00000_basic_bad_pixel_mask.tiff",
-    "dead_candidate_mask_tiff": "/Users/cheng-hunglin/Documents/codex_projects/mask_baseline_output/Cu2O_liquid_pdf_20260314-140254_db261a_primary-dk_sub_image-00000_dead_candidate_mask.tiff",
-    "hot_candidate_mask_tiff": "/Users/cheng-hunglin/Documents/codex_projects/mask_baseline_output/Cu2O_liquid_pdf_20260314-140254_db261a_primary-dk_sub_image-00000_hot_candidate_mask.tiff",
-    "log_normalized_npy": "/Users/cheng-hunglin/Documents/codex_projects/mask_baseline_output/Cu2O_liquid_pdf_20260314-140254_db261a_primary-dk_sub_image-00000_log_normalized.npy",
-    "local_median_npy": "/Users/cheng-hunglin/Documents/codex_projects/mask_baseline_output/Cu2O_liquid_pdf_20260314-140254_db261a_primary-dk_sub_image-00000_local_median.npy",
-    "local_residual_npy": "/Users/cheng-hunglin/Documents/codex_projects/mask_baseline_output/Cu2O_liquid_pdf_20260314-140254_db261a_primary-dk_sub_image-00000_local_residual.npy",
-    "local_zscore_npy": "/Users/cheng-hunglin/Documents/codex_projects/mask_baseline_output/Cu2O_liquid_pdf_20260314-140254_db261a_primary-dk_sub_image-00000_local_zscore.npy"
+    "mask_npy": "/Users/cheng-hunglin/Documents/Codex/auto_ADmask/mask_baseline_output/Cu2O_liquid_pdf_20260314-140254_db261a_primary-dk_sub_image-00000_basic_bad_pixel_mask.npy"
   }
 }
