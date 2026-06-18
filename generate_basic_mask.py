@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Class-based detector bad-pixel mask generation.
 
 The generated mask uses 1 for bad/invalid pixels and 0 for good pixels.
@@ -9,15 +8,15 @@ The class can start from a user-supplied baseline .npy mask, then add:
   4. the existing optional beamstop detector
 
 No files are written automatically. Import the class, tune parameters when calling
-``generate_mask()``, and save or inspect the returned array however you like.
+``generate_mask()``, and call ``save_mask_npy()`` or ``save_summary_json()`` only
+when you want output files.
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
@@ -36,24 +35,48 @@ class DetectorMaskGenerator:
     """
 
     DEFAULTS: dict[str, Any] = {
+        # TIFF frame to read for multi-page TIFFs; ordinary single-frame TIFFs use 0.
         "frame": 0,
+        # Odd local neighborhood width for median/MAD filtering. Larger windows
+        # are smoother but less sensitive to narrow detector defects.
         "window": 7,
+        # Number of detector rows processed per tile during median filtering.
+        # Lower this if memory becomes tight for very large detectors.
         "tile_rows": 256,
+        # Raw intensity percentile treated as the zero point before log scaling.
+        # Raising this suppresses more low-end background before analysis.
         "log_low_percentile": 0.5,
+        # Log intensity percentile mapped to 1.0. Lower values increase contrast
+        # in bright regions but can compress very intense scattering.
         "log_high_percentile": 99.5,
+        # Local z-score thresholds for low-response/dead and high-response/hot
+        # candidates. More extreme values make the mask more conservative.
         "dead_z": -8.0,
         "hot_z": 12.0,
+        # Percentile floor for local robust sigma. This prevents tiny local noise
+        # estimates from making normal pixels look like huge z-score outliers.
         "sigma_floor_percentile": 5.0,
+        # Beamstop handling: "auto" keeps the existing detector, "off" disables it.
         "beamstop": "auto",
+        # Low-intensity percentile used by the beamstop detector on the log image.
         "beamstop_low_percentile": 3.0,
+        # Horizontal search range around the detected beamstop column.
         "beamstop_search_half_width": 120,
+        # Maximum row-wise distance from the detected center column for accepting
+        # a low-response run as part of the beamstop.
         "beamstop_max_anchor_distance": 50,
+        # Accepted width range, in pixels, for low-response row runs in the
+        # beamstop detector. These reject isolated speckles and huge regions.
         "beamstop_min_run_width": 3,
         "beamstop_max_run_width": 80,
+        # Extra horizontal padding added to each accepted beamstop row/stripe.
         "beamstop_padding": 8,
+        # Ellipse radii used to cover the beamstop tip around the first detected row.
         "beamstop_tip_radius_x": 24,
         "beamstop_tip_radius_y": 32,
+        # Detector border width, in pixels, always marked bad. Set 0 to disable.
         "border": 10,
+        # Optional final binary dilation iterations. Set 0 to leave the mask sharp.
         "dilate": 0,
     }
 
@@ -499,117 +522,17 @@ class DetectorMaskGenerator:
         np.save(output_path, mask.astype(np.uint8))
         return output_path
 
+    def save_summary_json(self, output_path: str | Path) -> Path:
+        """Write ``self.summary`` to a JSON file.
 
-def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Generate an in-memory detector mask from a TIFF and optional baseline .npy mask."
-    )
-    parser.add_argument("image", type=Path, help="Input TIFF detector image.")
-    parser.add_argument(
-        "--baseline-mask",
-        type=Path,
-        default=None,
-        help="Optional baseline .npy mask, 0=good and nonzero=bad.",
-    )
-    parser.add_argument("--frame", type=int, default=DetectorMaskGenerator.DEFAULTS["frame"])
-    parser.add_argument("--window", type=int, default=DetectorMaskGenerator.DEFAULTS["window"])
-    parser.add_argument("--tile-rows", type=int, default=DetectorMaskGenerator.DEFAULTS["tile_rows"])
-    parser.add_argument(
-        "--log-low-percentile",
-        type=float,
-        default=DetectorMaskGenerator.DEFAULTS["log_low_percentile"],
-    )
-    parser.add_argument(
-        "--log-high-percentile",
-        type=float,
-        default=DetectorMaskGenerator.DEFAULTS["log_high_percentile"],
-    )
-    parser.add_argument("--dead-z", type=float, default=DetectorMaskGenerator.DEFAULTS["dead_z"])
-    parser.add_argument("--hot-z", type=float, default=DetectorMaskGenerator.DEFAULTS["hot_z"])
-    parser.add_argument(
-        "--sigma-floor-percentile",
-        type=float,
-        default=DetectorMaskGenerator.DEFAULTS["sigma_floor_percentile"],
-    )
-    parser.add_argument(
-        "--beamstop",
-        choices=("auto", "off"),
-        default=DetectorMaskGenerator.DEFAULTS["beamstop"],
-    )
-    parser.add_argument(
-        "--beamstop-low-percentile",
-        type=float,
-        default=DetectorMaskGenerator.DEFAULTS["beamstop_low_percentile"],
-    )
-    parser.add_argument(
-        "--beamstop-search-half-width",
-        type=int,
-        default=DetectorMaskGenerator.DEFAULTS["beamstop_search_half_width"],
-    )
-    parser.add_argument(
-        "--beamstop-max-anchor-distance",
-        type=int,
-        default=DetectorMaskGenerator.DEFAULTS["beamstop_max_anchor_distance"],
-    )
-    parser.add_argument(
-        "--beamstop-min-run-width",
-        type=int,
-        default=DetectorMaskGenerator.DEFAULTS["beamstop_min_run_width"],
-    )
-    parser.add_argument(
-        "--beamstop-max-run-width",
-        type=int,
-        default=DetectorMaskGenerator.DEFAULTS["beamstop_max_run_width"],
-    )
-    parser.add_argument(
-        "--beamstop-padding",
-        type=int,
-        default=DetectorMaskGenerator.DEFAULTS["beamstop_padding"],
-    )
-    parser.add_argument(
-        "--beamstop-tip-radius-x",
-        type=int,
-        default=DetectorMaskGenerator.DEFAULTS["beamstop_tip_radius_x"],
-    )
-    parser.add_argument(
-        "--beamstop-tip-radius-y",
-        type=int,
-        default=DetectorMaskGenerator.DEFAULTS["beamstop_tip_radius_y"],
-    )
-    parser.add_argument("--border", type=int, default=DetectorMaskGenerator.DEFAULTS["border"])
-    parser.add_argument("--dilate", type=int, default=DetectorMaskGenerator.DEFAULTS["dilate"])
-    return parser.parse_args(argv)
+        Call ``generate_mask()`` first so the summary includes the current
+        parameter values, component mask counts, and final mask statistics.
+        """
 
+        if not self.summary:
+            raise ValueError("No summary available. Call generate_mask() before save_summary_json().")
 
-def main(argv: Iterable[str] | None = None) -> int:
-    args = parse_args(argv)
-    generator = DetectorMaskGenerator(
-        args.image,
-        baseline_mask_npy=args.baseline_mask,
-        frame=args.frame,
-        window=args.window,
-        tile_rows=args.tile_rows,
-        log_low_percentile=args.log_low_percentile,
-        log_high_percentile=args.log_high_percentile,
-        dead_z=args.dead_z,
-        hot_z=args.hot_z,
-        sigma_floor_percentile=args.sigma_floor_percentile,
-        beamstop=args.beamstop,
-        beamstop_low_percentile=args.beamstop_low_percentile,
-        beamstop_search_half_width=args.beamstop_search_half_width,
-        beamstop_max_anchor_distance=args.beamstop_max_anchor_distance,
-        beamstop_min_run_width=args.beamstop_min_run_width,
-        beamstop_max_run_width=args.beamstop_max_run_width,
-        beamstop_padding=args.beamstop_padding,
-        beamstop_tip_radius_x=args.beamstop_tip_radius_x,
-        beamstop_tip_radius_y=args.beamstop_tip_radius_y,
-        border=args.border,
-        dilate=args.dilate,
-    )
-    generator.generate_mask()
-    print(json.dumps(generator.summary, indent=2))
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+        output_path = Path(output_path).resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(self.summary, indent=2) + "\n", encoding="utf-8")
+        return output_path
