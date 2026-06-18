@@ -2,7 +2,7 @@
 """Class-based detector bad-pixel mask generation.
 
 The generated mask uses 1 for bad/invalid pixels and 0 for good pixels.
-The class starts from a user-supplied baseline .npy mask, then can add:
+The class can start from a user-supplied baseline .npy mask, then add:
   1. invalid/non-finite pixels
   2. local low/high outliers from a robust local z-score
   3. an optional detector border mask
@@ -28,7 +28,7 @@ TIFF_EXTENSIONS = {".tif", ".tiff", ".TIF", ".TIFF"}
 
 
 class DetectorMaskGenerator:
-    """Generate detector masks from a TIFF image and a baseline .npy mask.
+    """Generate detector masks from a TIFF image and an optional baseline .npy mask.
 
     Parameters can be set at initialization and overridden per call to
     ``generate_mask``. The final returned mask is a uint8 array with values
@@ -60,20 +60,35 @@ class DetectorMaskGenerator:
     def __init__(
         self,
         tiff_file: str | Path,
-        basic_mask_npy: str | Path,
+        *,
+        baseline_mask_npy: str | Path | None = None,
         **parameters: Any,
     ) -> None:
+        """Load the detector TIFF and optional starting mask.
+
+        If ``baseline_mask_npy`` is omitted, the generator starts from an
+        all-good scratch mask and only masks pixels found by later steps.
+        """
+
         unknown = sorted(set(parameters) - set(self.DEFAULTS))
         if unknown:
             raise ValueError(f"Unknown parameter(s): {', '.join(unknown)}")
 
         self.tiff_file = Path(tiff_file).resolve()
-        self.basic_mask_npy = Path(basic_mask_npy).resolve()
+        self.baseline_mask_npy = (
+            Path(baseline_mask_npy).resolve() if baseline_mask_npy is not None else None
+        )
         self.parameters = {**self.DEFAULTS, **parameters}
 
         self.raw = self.read_tiff(self.tiff_file, frame=int(self.parameters["frame"]))
         self.finite = np.isfinite(self.raw)
-        self.basic_mask = self.load_basic_mask(self.basic_mask_npy, expected_shape=self.raw.shape)
+        if self.baseline_mask_npy is None:
+            self.baseline_mask = np.zeros(self.raw.shape, dtype=bool)
+        else:
+            self.baseline_mask = self.load_baseline_mask(
+                self.baseline_mask_npy,
+                expected_shape=self.raw.shape,
+            )
 
         self.log_normalized: np.ndarray | None = None
         self.local_median: np.ndarray | None = None
@@ -88,6 +103,8 @@ class DetectorMaskGenerator:
 
     @staticmethod
     def find_first_tiff(folder: str | Path = ".") -> Path:
+        """Return the first TIFF file in a folder for quick interactive use."""
+
         folder = Path(folder)
         candidates = sorted(
             path for path in folder.iterdir() if path.is_file() and path.suffix in TIFF_EXTENSIONS
@@ -98,6 +115,8 @@ class DetectorMaskGenerator:
 
     @staticmethod
     def read_tiff(path: str | Path, frame: int = 0) -> np.ndarray:
+        """Read one 2D detector frame from a TIFF file as float32."""
+
         with Image.open(path) as image:
             if frame:
                 image.seek(frame)
@@ -107,16 +126,20 @@ class DetectorMaskGenerator:
         return array
 
     @staticmethod
-    def load_basic_mask(path: str | Path, expected_shape: tuple[int, int]) -> np.ndarray:
+    def load_baseline_mask(path: str | Path, expected_shape: tuple[int, int]) -> np.ndarray:
+        """Load a baseline .npy mask and convert nonzero values to bad pixels."""
+
         mask = np.load(path)
         if mask.shape != expected_shape:
             raise ValueError(
-                f"Basic mask shape {mask.shape} does not match detector image shape {expected_shape}"
+                f"Baseline mask shape {mask.shape} does not match detector image shape {expected_shape}"
             )
         return mask.astype(bool)
 
     @staticmethod
     def finite_percentile(array: np.ndarray, q: float) -> float:
+        """Compute a percentile while ignoring NaN and infinite values."""
+
         finite = array[np.isfinite(array)]
         if finite.size == 0:
             raise ValueError("Image contains no finite pixels")
@@ -128,6 +151,8 @@ class DetectorMaskGenerator:
         low_percentile: float,
         high_percentile: float,
     ) -> tuple[np.ndarray, dict[str, float]]:
+        """Shift, log-scale, and normalize intensities to a clipped 0-1 range."""
+
         finite = np.isfinite(image)
         low = self.finite_percentile(image, low_percentile)
 
@@ -149,6 +174,8 @@ class DetectorMaskGenerator:
         }
 
     def median_filter_tiled(self, array: np.ndarray, window: int, tile_rows: int) -> np.ndarray:
+        """Apply a median filter in row tiles to limit peak memory use."""
+
         if window % 2 != 1 or window < 3:
             raise ValueError("window must be an odd integer >= 3")
 
@@ -176,6 +203,8 @@ class DetectorMaskGenerator:
         tile_rows: int,
         sigma_floor_percentile: float,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+        """Compute local median, residual, and robust local z-score maps."""
+
         local_median = self.median_filter_tiled(analysis_image, window, tile_rows)
         residual = analysis_image - local_median
 
@@ -195,6 +224,8 @@ class DetectorMaskGenerator:
 
     @staticmethod
     def binary_dilate(mask: np.ndarray, iterations: int) -> np.ndarray:
+        """Expand a boolean mask by one pixel per iteration in all directions."""
+
         result = mask.astype(bool, copy=True)
         for _ in range(iterations):
             padded = np.pad(result, 1, mode="constant", constant_values=False)
@@ -219,7 +250,7 @@ class DetectorMaskGenerator:
         tip_radius_y: int,
         border: int,
     ) -> tuple[np.ndarray, dict[str, int | float | bool | None]]:
-        """Keep the existing vertical low-response beamstop detector available."""
+        """Build a candidate mask for a vertical low-response beamstop shadow."""
 
         height, width = analysis_image.shape
         mask = np.zeros_like(finite, dtype=bool)
@@ -328,6 +359,8 @@ class DetectorMaskGenerator:
         return mask, details
 
     def _merged_parameters(self, overrides: dict[str, Any]) -> dict[str, Any]:
+        """Combine initialization defaults with per-call parameter overrides."""
+
         unknown = sorted(set(overrides) - set(self.DEFAULTS))
         if unknown:
             raise ValueError(f"Unknown parameter(s): {', '.join(unknown)}")
@@ -337,7 +370,11 @@ class DetectorMaskGenerator:
         """Generate and return the final uint8 mask without saving files.
 
         Example:
-            generator = DetectorMaskGenerator("image.tiff", "basic_mask.npy", border=10)
+            generator = DetectorMaskGenerator(
+                "image.tiff",
+                baseline_mask_npy="baseline_mask.npy",
+                border=10,
+            )
             mask = generator.generate_mask(dead_z=-10, hot_z=15, beamstop="off")
         """
 
@@ -387,7 +424,7 @@ class DetectorMaskGenerator:
                 border=int(params["border"]),
             )
 
-        final_mask_bool = self.basic_mask | invalid_mask | dead_mask | hot_mask | beamstop_mask
+        final_mask_bool = self.baseline_mask | invalid_mask | dead_mask | hot_mask | beamstop_mask
 
         border = int(params["border"])
         if border > 0:
@@ -415,7 +452,7 @@ class DetectorMaskGenerator:
         total_count = int(self.final_mask.size)
         self.summary = {
             "input_image": str(self.tiff_file),
-            "basic_mask_npy": str(self.basic_mask_npy),
+            "baseline_mask_npy": str(self.baseline_mask_npy) if self.baseline_mask_npy else None,
             "shape": list(self.raw.shape),
             "dtype_after_read": str(self.raw.dtype),
             "raw_min": float(np.min(finite_raw)),
@@ -431,7 +468,7 @@ class DetectorMaskGenerator:
             "sigma_floor": sigma_floor,
             "dilate_iterations": dilate,
             "border_pixels_marked_bad": border,
-            "basic_mask_count": int(self.basic_mask.sum()),
+            "baseline_mask_count": int(self.baseline_mask.sum()),
             "invalid_pixel_count": int(invalid_mask.sum()),
             "dead_candidate_count": int(dead_mask.sum()),
             "hot_candidate_count": int(hot_mask.sum()),
@@ -444,13 +481,36 @@ class DetectorMaskGenerator:
         }
         return self.final_mask
 
+    def save_mask_npy(self, output_path: str | Path, mask: np.ndarray | None = None) -> Path:
+        """Save a generated mask, or ``self.final_mask``, as a uint8 .npy file.
+
+        Call ``generate_mask()`` first unless you pass an explicit ``mask``.
+        The returned path is resolved so notebooks can report exactly what was
+        written.
+        """
+
+        if mask is None:
+            if self.final_mask is None:
+                raise ValueError("No mask available. Call generate_mask() before save_mask_npy().")
+            mask = self.final_mask
+
+        output_path = Path(output_path).resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(output_path, mask.astype(np.uint8))
+        return output_path
+
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate an in-memory detector mask from a TIFF and baseline .npy mask."
+        description="Generate an in-memory detector mask from a TIFF and optional baseline .npy mask."
     )
     parser.add_argument("image", type=Path, help="Input TIFF detector image.")
-    parser.add_argument("basic_mask", type=Path, help="Input baseline .npy mask, 0=good and nonzero=bad.")
+    parser.add_argument(
+        "--baseline-mask",
+        type=Path,
+        default=None,
+        help="Optional baseline .npy mask, 0=good and nonzero=bad.",
+    )
     parser.add_argument("--frame", type=int, default=DetectorMaskGenerator.DEFAULTS["frame"])
     parser.add_argument("--window", type=int, default=DetectorMaskGenerator.DEFAULTS["window"])
     parser.add_argument("--tile-rows", type=int, default=DetectorMaskGenerator.DEFAULTS["tile_rows"])
@@ -525,7 +585,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
     generator = DetectorMaskGenerator(
         args.image,
-        args.basic_mask,
+        baseline_mask_npy=args.baseline_mask,
         frame=args.frame,
         window=args.window,
         tile_rows=args.tile_rows,
