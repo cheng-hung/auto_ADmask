@@ -1,0 +1,14 @@
+# Nota: C-Order, 1 refers to the Y axis, 2 to the X axis
+# Calibration done on Fri Jun 19 14:57:18 2026
+poni_version: 2.1
+Detector: Detector
+Detector_config: {"pixel1": 0.00019999999999999998, "pixel2": 0.00019999999999999998, "max_shape": [2048, 2048], "orientation": 3}
+Distance: 0.2155658118791799
+Poni1: 0.19959053797654552
+Poni2: 0.2028757754947736
+Rot1: -0.0024215622830740095
+Rot2: 0.0007870928691089929
+Rot3: 0.0
+Wavelength: 1.6650000000000002e-11
+# Calibrant: CeO2
+# Image: fabio:///Users/cheng-hunglin/Documents/Codex/auto_ADmask/test_data/Insitu_CeO2_powder_wall_PDF_20260329-222251_96924f_sub.tiff

@@ -4,8 +4,9 @@ The generated mask uses 1 for bad/invalid pixels and 0 for good pixels.
 The class can start from a user-supplied baseline .npy mask, then add:
   1. invalid/non-finite pixels
   2. local low/high outliers from a robust local z-score
-  3. an optional detector border mask
-  4. the existing optional beamstop detector
+  3. optional radial-profile residual hot-pixel candidates
+  4. an optional detector border mask
+  5. the existing optional beamstop detector
 
 No files are written automatically. Import the class, tune parameters when calling
 ``generate_mask()``, and call ``save_mask_npy()`` or ``save_summary_json()`` only
@@ -68,6 +69,39 @@ class DetectorMaskGenerator:
         # candidates. More extreme values make the mask more conservative.
         "dead_z": -8.0,
         "hot_z": 12.0,
+        # Ring-aware hot-pixel detector. Enable this when a calibrated
+        # diffraction center is available and hot pixels are mixed with rings.
+        "use_radial_detector": False,
+        # Diffraction center in detector pixel coordinates. x is column, y is row.
+        "center_x": None,
+        "center_y": None,
+        # Radial bin width in pixels. Smaller bins follow sharp rings better;
+        # larger bins are more stable when rings are weak or sparse.
+        "radial_bin_width": 1.0,
+        # Optional radial range, in pixels, where radial detection is active.
+        # Leave as None to use the full detector radius range.
+        "radial_min_radius": None,
+        "radial_max_radius": None,
+        # Positive residual threshold after radial-profile normalization.
+        # Larger values are more conservative for hot-pixel detection.
+        "radial_hot_z": 8.0,
+        # Image used for the radial residual detector: "raw" preserves hot-pixel
+        # amplitude, while "log" compresses dynamic range.
+        "radial_analysis_image": "raw",
+        # Minimum number of valid pixels required to estimate a radial bin.
+        "radial_min_bin_pixels": 50,
+        # Percentile floor for per-ring robust sigma values. This prevents bins
+        # with tiny MAD from over-amplifying normal fluctuations.
+        "radial_sigma_floor_percentile": 5.0,
+        # Exclude baseline/beamstop-masked pixels when fitting radial profiles.
+        "radial_profile_exclude_masked": True,
+        # Connected-component filter for radial hot candidates. Defaults keep
+        # single pixels and tiny compact clusters while rejecting ring arcs.
+        "radial_component_min_pixels": 1,
+        "radial_component_max_pixels": 6,
+        "radial_component_max_width": 4,
+        "radial_component_max_height": 4,
+        "radial_component_max_aspect_ratio": 2.5,
         # Percentile floor for local robust sigma. This prevents tiny local noise
         # estimates from making normal pixels look like huge z-score outliers.
         "sigma_floor_percentile": 5.0,
@@ -136,6 +170,10 @@ class DetectorMaskGenerator:
         self.invalid_mask: np.ndarray | None = None
         self.dead_mask: np.ndarray | None = None
         self.hot_mask: np.ndarray | None = None
+        self.radial_expected: np.ndarray | None = None
+        self.radial_residual: np.ndarray | None = None
+        self.radial_zscore: np.ndarray | None = None
+        self.radial_mask: np.ndarray | None = None
         self.beamstop_mask: np.ndarray | None = None
         self.final_mask: np.ndarray | None = None
         self.summary: dict[str, Any] = {}
@@ -315,6 +353,341 @@ class DetectorMaskGenerator:
             zscore = residual / sigma_floor
 
         return local_median, residual.astype(np.float32), zscore.astype(np.float32), sigma_floor
+
+    def radial_profile_residual_detector(
+        self,
+        analysis_image: np.ndarray,
+        center_x: float,
+        center_y: float,
+        bin_width: float,
+        hot_z: float,
+        min_bin_pixels: int,
+        sigma_floor_percentile: float,
+        min_radius: float | None = None,
+        max_radius: float | None = None,
+        profile_exclude_mask: np.ndarray | None = None,
+        component_min_pixels: int = 1,
+        component_max_pixels: int | None = 6,
+        component_max_width: int | None = 4,
+        component_max_height: int | None = 4,
+        component_max_aspect_ratio: float | None = 2.5,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+        """Detect compact hot pixels after subtracting a radial intensity profile.
+
+        Pixels are grouped by radius from ``(center_x, center_y)``. Each radial
+        bin gets a robust median expected intensity and MAD-based sigma. Hot
+        candidates are positive radial residual outliers, then connected
+        components are filtered so long diffraction-ring fragments are rejected.
+        """
+
+        if bin_width <= 0:
+            raise ValueError("radial bin_width must be > 0")
+        if min_bin_pixels < 1:
+            raise ValueError("radial min_bin_pixels must be >= 1")
+
+        height, width = analysis_image.shape
+        yy, xx = np.indices((height, width), dtype=np.float32)
+        radius = np.sqrt((xx - float(center_x)) ** 2 + (yy - float(center_y)) ** 2)
+
+        finite = np.isfinite(analysis_image)
+        radial_range = np.ones_like(finite, dtype=bool)
+        if min_radius is not None:
+            radial_range &= radius >= float(min_radius)
+        if max_radius is not None:
+            radial_range &= radius <= float(max_radius)
+
+        profile_valid = finite & radial_range
+        if profile_exclude_mask is not None:
+            profile_valid &= ~profile_exclude_mask.astype(bool)
+
+        image_flat = analysis_image.ravel()
+        radius_flat = radius.ravel()
+        profile_indices = np.flatnonzero(profile_valid.ravel())
+
+        expected = np.full(analysis_image.size, np.nan, dtype=np.float32)
+        zscore = np.full(analysis_image.size, np.nan, dtype=np.float32)
+        residual = np.full(analysis_image.size, np.nan, dtype=np.float32)
+        details: dict[str, Any] = {
+            "radial_detector_enabled": True,
+            "radial_center_x": float(center_x),
+            "radial_center_y": float(center_y),
+            "radial_bin_width": float(bin_width),
+            "radial_min_radius": None if min_radius is None else float(min_radius),
+            "radial_max_radius": None if max_radius is None else float(max_radius),
+            "radial_hot_z": float(hot_z),
+            "radial_min_bin_pixels": int(min_bin_pixels),
+            "radial_valid_bin_count": 0,
+            "radial_sigma_floor": None,
+            "radial_raw_candidate_count": 0,
+            "radial_component_count": 0,
+            "radial_component_kept_count": 0,
+            "radial_component_rejected_size_count": 0,
+            "radial_component_rejected_shape_count": 0,
+        }
+
+        if profile_indices.size == 0:
+            empty = np.zeros_like(finite, dtype=bool)
+            return empty, expected.reshape(analysis_image.shape), residual.reshape(
+                analysis_image.shape
+            ), zscore.reshape(analysis_image.shape), details
+
+        profile_bins = np.floor(radius_flat[profile_indices] / float(bin_width)).astype(np.int32)
+        max_bin = int(profile_bins.max())
+        expected_by_bin = np.full(max_bin + 1, np.nan, dtype=np.float32)
+        sigma_by_bin = np.full(max_bin + 1, np.nan, dtype=np.float32)
+        counts_by_bin = np.zeros(max_bin + 1, dtype=np.int32)
+
+        order = np.argsort(profile_bins, kind="stable")
+        sorted_bins = profile_bins[order]
+        sorted_indices = profile_indices[order]
+        group_starts = np.flatnonzero(np.r_[True, sorted_bins[1:] != sorted_bins[:-1]])
+        group_ends = np.r_[group_starts[1:], sorted_bins.size]
+
+        for start, end in zip(group_starts, group_ends):
+            bin_id = int(sorted_bins[start])
+            bin_indices = sorted_indices[start:end]
+            counts_by_bin[bin_id] = bin_indices.size
+            if bin_indices.size < min_bin_pixels:
+                continue
+
+            values = image_flat[bin_indices]
+            expected_value = float(np.median(values))
+            bin_residual = values - expected_value
+            sigma_value = 1.4826 * float(np.median(np.abs(bin_residual)))
+            expected_by_bin[bin_id] = expected_value
+            sigma_by_bin[bin_id] = sigma_value
+
+        positive_sigmas = sigma_by_bin[np.isfinite(sigma_by_bin) & (sigma_by_bin > 0)]
+        if positive_sigmas.size:
+            sigma_floor = max(float(np.percentile(positive_sigmas, sigma_floor_percentile)), 1.0e-6)
+        else:
+            sigma_floor = 1.0e-6
+        details["radial_sigma_floor"] = sigma_floor
+
+        valid_bin = np.isfinite(expected_by_bin) & np.isfinite(sigma_by_bin)
+        details["radial_valid_bin_count"] = int(valid_bin.sum())
+        if not valid_bin.any():
+            empty = np.zeros_like(finite, dtype=bool)
+            return empty, expected.reshape(analysis_image.shape), residual.reshape(
+                analysis_image.shape
+            ), zscore.reshape(analysis_image.shape), details
+
+        detection_valid = finite & radial_range
+        detection_indices = np.flatnonzero(detection_valid.ravel())
+        detection_bins = np.floor(radius_flat[detection_indices] / float(bin_width)).astype(np.int32)
+        in_profile = np.zeros(detection_bins.shape, dtype=bool)
+        within_bin_range = detection_bins <= max_bin
+        in_profile[within_bin_range] = valid_bin[detection_bins[within_bin_range]]
+        detection_indices = detection_indices[in_profile]
+        detection_bins = detection_bins[in_profile]
+
+        detection_expected = expected_by_bin[detection_bins]
+        detection_sigma = np.maximum(sigma_by_bin[detection_bins], sigma_floor)
+        expected[detection_indices] = detection_expected
+        residual[detection_indices] = image_flat[detection_indices] - detection_expected
+        zscore[detection_indices] = residual[detection_indices] / detection_sigma
+
+        raw_candidates = zscore.reshape(analysis_image.shape) >= float(hot_z)
+        raw_candidates &= detection_valid
+        details["radial_raw_candidate_count"] = int(raw_candidates.sum())
+
+        filtered, component_info = self.filter_connected_components(
+            raw_candidates,
+            min_pixels=component_min_pixels,
+            max_pixels=component_max_pixels,
+            max_width=component_max_width,
+            max_height=component_max_height,
+            max_aspect_ratio=component_max_aspect_ratio,
+        )
+        details.update(component_info)
+        return (
+            filtered,
+            expected.reshape(analysis_image.shape),
+            residual.reshape(analysis_image.shape),
+            zscore.reshape(analysis_image.shape),
+            details,
+        )
+
+    @staticmethod
+    def filter_connected_components(
+        candidate_mask: np.ndarray,
+        min_pixels: int = 1,
+        max_pixels: int | None = 6,
+        max_width: int | None = 4,
+        max_height: int | None = 4,
+        max_aspect_ratio: float | None = 2.5,
+    ) -> tuple[np.ndarray, dict[str, int]]:
+        """Keep only compact connected components from a candidate hot-pixel mask."""
+
+        try:
+            from scipy import ndimage
+
+            return DetectorMaskGenerator._filter_components_with_scipy(
+                candidate_mask,
+                min_pixels=min_pixels,
+                max_pixels=max_pixels,
+                max_width=max_width,
+                max_height=max_height,
+                max_aspect_ratio=max_aspect_ratio,
+                ndimage=ndimage,
+            )
+        except Exception:
+            return DetectorMaskGenerator._filter_components_fallback(
+                candidate_mask,
+                min_pixels=min_pixels,
+                max_pixels=max_pixels,
+                max_width=max_width,
+                max_height=max_height,
+                max_aspect_ratio=max_aspect_ratio,
+            )
+
+    @staticmethod
+    def _component_is_compact(
+        area: int,
+        height: int,
+        width: int,
+        min_pixels: int,
+        max_pixels: int | None,
+        max_width: int | None,
+        max_height: int | None,
+        max_aspect_ratio: float | None,
+    ) -> tuple[bool, str | None]:
+        """Apply size and shape limits to one connected component."""
+
+        if area < min_pixels or (max_pixels is not None and area > max_pixels):
+            return False, "size"
+        if max_width is not None and width > max_width:
+            return False, "shape"
+        if max_height is not None and height > max_height:
+            return False, "shape"
+        if max_aspect_ratio is not None:
+            aspect_ratio = max(height, width) / max(1, min(height, width))
+            if aspect_ratio > max_aspect_ratio:
+                return False, "shape"
+        return True, None
+
+    @staticmethod
+    def _filter_components_with_scipy(
+        candidate_mask: np.ndarray,
+        min_pixels: int,
+        max_pixels: int | None,
+        max_width: int | None,
+        max_height: int | None,
+        max_aspect_ratio: float | None,
+        ndimage: Any,
+    ) -> tuple[np.ndarray, dict[str, int]]:
+        """Connected-component filtering using scipy.ndimage when available."""
+
+        structure = np.ones((3, 3), dtype=bool)
+        labels, component_count = ndimage.label(candidate_mask, structure=structure)
+        slices = ndimage.find_objects(labels)
+        filtered = np.zeros_like(candidate_mask, dtype=bool)
+        info = {
+            "radial_component_count": int(component_count),
+            "radial_component_kept_count": 0,
+            "radial_component_rejected_size_count": 0,
+            "radial_component_rejected_shape_count": 0,
+        }
+
+        for label_id, component_slice in enumerate(slices, start=1):
+            if component_slice is None:
+                continue
+            component = labels[component_slice] == label_id
+            area = int(component.sum())
+            height, width = component.shape
+            keep, reason = DetectorMaskGenerator._component_is_compact(
+                area,
+                height,
+                width,
+                min_pixels,
+                max_pixels,
+                max_width,
+                max_height,
+                max_aspect_ratio,
+            )
+            if keep:
+                view = filtered[component_slice]
+                view[component] = True
+                info["radial_component_kept_count"] += 1
+            elif reason == "size":
+                info["radial_component_rejected_size_count"] += 1
+            else:
+                info["radial_component_rejected_shape_count"] += 1
+
+        return filtered, info
+
+    @staticmethod
+    def _filter_components_fallback(
+        candidate_mask: np.ndarray,
+        min_pixels: int,
+        max_pixels: int | None,
+        max_width: int | None,
+        max_height: int | None,
+        max_aspect_ratio: float | None,
+    ) -> tuple[np.ndarray, dict[str, int]]:
+        """Connected-component filtering fallback without scipy."""
+
+        candidate_mask = candidate_mask.astype(bool, copy=False)
+        visited = np.zeros_like(candidate_mask, dtype=bool)
+        filtered = np.zeros_like(candidate_mask, dtype=bool)
+        height, width = candidate_mask.shape
+        info = {
+            "radial_component_count": 0,
+            "radial_component_kept_count": 0,
+            "radial_component_rejected_size_count": 0,
+            "radial_component_rejected_shape_count": 0,
+        }
+
+        starts = np.argwhere(candidate_mask)
+        for start_row, start_col in starts:
+            if visited[start_row, start_col]:
+                continue
+
+            stack = [(int(start_row), int(start_col))]
+            visited[start_row, start_col] = True
+            pixels: list[tuple[int, int]] = []
+            min_row = max_row = int(start_row)
+            min_col = max_col = int(start_col)
+
+            while stack:
+                row, col = stack.pop()
+                pixels.append((row, col))
+                min_row = min(min_row, row)
+                max_row = max(max_row, row)
+                min_col = min(min_col, col)
+                max_col = max(max_col, col)
+
+                for next_row in range(max(0, row - 1), min(height, row + 2)):
+                    for next_col in range(max(0, col - 1), min(width, col + 2)):
+                        if visited[next_row, next_col] or not candidate_mask[next_row, next_col]:
+                            continue
+                        visited[next_row, next_col] = True
+                        stack.append((next_row, next_col))
+
+            info["radial_component_count"] += 1
+            area = len(pixels)
+            component_height = max_row - min_row + 1
+            component_width = max_col - min_col + 1
+            keep, reason = DetectorMaskGenerator._component_is_compact(
+                area,
+                component_height,
+                component_width,
+                min_pixels,
+                max_pixels,
+                max_width,
+                max_height,
+                max_aspect_ratio,
+            )
+            if keep:
+                for row, col in pixels:
+                    filtered[row, col] = True
+                info["radial_component_kept_count"] += 1
+            elif reason == "size":
+                info["radial_component_rejected_size_count"] += 1
+            else:
+                info["radial_component_rejected_shape_count"] += 1
+
+        return filtered, info
 
     @staticmethod
     def binary_dilate(mask: np.ndarray, iterations: int) -> np.ndarray:
@@ -520,7 +893,114 @@ class DetectorMaskGenerator:
                 border=int(params["border"]),
             )
 
-        final_mask_bool = self.baseline_mask | invalid_mask | dead_mask | hot_mask | beamstop_mask
+        radial_mask = np.zeros_like(self.finite, dtype=bool)
+        radial_expected = np.full_like(self.raw, np.nan, dtype=np.float32)
+        radial_residual = np.full_like(self.raw, np.nan, dtype=np.float32)
+        radial_zscore = np.full_like(self.raw, np.nan, dtype=np.float32)
+        radial_info: dict[str, Any] = {
+            "radial_detector_enabled": bool(params["use_radial_detector"]),
+            "radial_analysis_image": params["radial_analysis_image"],
+            "radial_profile_exclude_masked": bool(params["radial_profile_exclude_masked"]),
+            "radial_center_x": None,
+            "radial_center_y": None,
+            "radial_bin_width": float(params["radial_bin_width"]),
+            "radial_min_radius": params["radial_min_radius"],
+            "radial_max_radius": params["radial_max_radius"],
+            "radial_hot_z": float(params["radial_hot_z"]),
+            "radial_min_bin_pixels": int(params["radial_min_bin_pixels"]),
+            "radial_sigma_floor_percentile": float(params["radial_sigma_floor_percentile"]),
+            "radial_component_min_pixels": int(params["radial_component_min_pixels"]),
+            "radial_component_max_pixels": params["radial_component_max_pixels"],
+            "radial_component_max_width": params["radial_component_max_width"],
+            "radial_component_max_height": params["radial_component_max_height"],
+            "radial_component_max_aspect_ratio": params["radial_component_max_aspect_ratio"],
+            "radial_valid_bin_count": 0,
+            "radial_sigma_floor": None,
+            "radial_raw_candidate_count": 0,
+            "radial_component_count": 0,
+            "radial_component_kept_count": 0,
+            "radial_component_rejected_size_count": 0,
+            "radial_component_rejected_shape_count": 0,
+            "radial_mask_count": 0,
+        }
+        if params["use_radial_detector"]:
+            if params["center_x"] is None or params["center_y"] is None:
+                raise ValueError("center_x and center_y are required when use_radial_detector=True")
+
+            radial_analysis_image = params["radial_analysis_image"]
+            if radial_analysis_image == "raw":
+                radial_image = self.raw
+            elif radial_analysis_image == "log":
+                radial_image = log_normalized
+            else:
+                raise ValueError("radial_analysis_image must be 'raw' or 'log'")
+
+            profile_exclude_mask = None
+            if bool(params["radial_profile_exclude_masked"]):
+                profile_exclude_mask = self.baseline_mask | beamstop_mask
+
+            radial_mask, radial_expected, radial_residual, radial_zscore, radial_info = (
+                self.radial_profile_residual_detector(
+                    radial_image,
+                    center_x=float(params["center_x"]),
+                    center_y=float(params["center_y"]),
+                    bin_width=float(params["radial_bin_width"]),
+                    hot_z=float(params["radial_hot_z"]),
+                    min_bin_pixels=int(params["radial_min_bin_pixels"]),
+                    sigma_floor_percentile=float(params["radial_sigma_floor_percentile"]),
+                    min_radius=(
+                        None
+                        if params["radial_min_radius"] is None
+                        else float(params["radial_min_radius"])
+                    ),
+                    max_radius=(
+                        None
+                        if params["radial_max_radius"] is None
+                        else float(params["radial_max_radius"])
+                    ),
+                    profile_exclude_mask=profile_exclude_mask,
+                    component_min_pixels=int(params["radial_component_min_pixels"]),
+                    component_max_pixels=(
+                        None
+                        if params["radial_component_max_pixels"] is None
+                        else int(params["radial_component_max_pixels"])
+                    ),
+                    component_max_width=(
+                        None
+                        if params["radial_component_max_width"] is None
+                        else int(params["radial_component_max_width"])
+                    ),
+                    component_max_height=(
+                        None
+                        if params["radial_component_max_height"] is None
+                        else int(params["radial_component_max_height"])
+                    ),
+                    component_max_aspect_ratio=(
+                        None
+                        if params["radial_component_max_aspect_ratio"] is None
+                        else float(params["radial_component_max_aspect_ratio"])
+                    ),
+                )
+            )
+            radial_info["radial_analysis_image"] = radial_analysis_image
+            radial_info["radial_profile_exclude_masked"] = bool(
+                params["radial_profile_exclude_masked"]
+            )
+            radial_info["radial_sigma_floor_percentile"] = float(
+                params["radial_sigma_floor_percentile"]
+            )
+            radial_info["radial_component_min_pixels"] = int(params["radial_component_min_pixels"])
+            radial_info["radial_component_max_pixels"] = params["radial_component_max_pixels"]
+            radial_info["radial_component_max_width"] = params["radial_component_max_width"]
+            radial_info["radial_component_max_height"] = params["radial_component_max_height"]
+            radial_info["radial_component_max_aspect_ratio"] = params[
+                "radial_component_max_aspect_ratio"
+            ]
+            radial_info["radial_mask_count"] = int(radial_mask.sum())
+
+        final_mask_bool = (
+            self.baseline_mask | invalid_mask | dead_mask | hot_mask | beamstop_mask | radial_mask
+        )
 
         border = int(params["border"])
         if border > 0:
@@ -540,6 +1020,10 @@ class DetectorMaskGenerator:
         self.invalid_mask = invalid_mask
         self.dead_mask = dead_mask
         self.hot_mask = hot_mask
+        self.radial_expected = radial_expected
+        self.radial_residual = radial_residual
+        self.radial_zscore = radial_zscore
+        self.radial_mask = radial_mask
         self.beamstop_mask = beamstop_mask
         self.final_mask = final_mask_bool.astype(np.uint8)
 
@@ -573,6 +1057,7 @@ class DetectorMaskGenerator:
             "invalid_pixel_count": int(invalid_mask.sum()),
             "dead_candidate_count": int(dead_mask.sum()),
             "hot_candidate_count": int(hot_mask.sum()),
+            **radial_info,
             "beamstop_mode": beamstop_mode,
             "beamstop_candidate_count": int(beamstop_mask.sum()),
             **beamstop_info,
