@@ -34,15 +34,30 @@ class DetectorMaskGenerator:
     0 for good pixels and 1 for bad pixels.
     """
 
+    LEGACY_PARAMETER_ALIASES = {
+        "window": "zscore_window",
+        "tile_rows": "zscore_tile_rows",
+    }
+
     DEFAULTS: dict[str, Any] = {
         # TIFF frame to read for multi-page TIFFs; ordinary single-frame TIFFs use 0.
         "frame": 0,
-        # Odd local neighborhood width for median/MAD filtering. Larger windows
-        # are smoother but less sensitive to narrow detector defects.
-        "window": 7,
-        # Number of detector rows processed per tile during median filtering.
+        # If True, robust_local_zscore subtracts a tiled local median and uses a
+        # tiled local MAD noise estimate. If False, it uses a global robust
+        # median/MAD z-score, which can preserve sharp hot-pixel spikes better
+        # but is more sensitive to broad intensity gradients.
+        "use_median_filter": True,
+        # Odd local neighborhood width for robust_local_zscore's local
+        # median/MAD calculation. Larger windows are smoother but less sensitive
+        # to narrow detector defects.
+        "zscore_window": 7,
+        # Number of detector rows processed per tile inside robust_local_zscore.
         # Lower this if memory becomes tight for very large detectors.
-        "tile_rows": 256,
+        "zscore_tile_rows": 256,
+        # Independent defaults for calling median_filter_tiled directly. These
+        # do not affect robust_local_zscore unless you pass them there yourself.
+        "median_window": 7,
+        "median_tile_rows": 256,
         # Raw intensity percentile treated as the zero point before log scaling.
         # Raising this suppresses more low-end background before analysis.
         "log_low_percentile": 0.5,
@@ -93,6 +108,7 @@ class DetectorMaskGenerator:
         all-good scratch mask and only masks pixels found by later steps.
         """
 
+        parameters = self._normalize_parameter_names(parameters)
         unknown = sorted(set(parameters) - set(self.DEFAULTS))
         if unknown:
             raise ValueError(f"Unknown parameter(s): {', '.join(unknown)}")
@@ -123,6 +139,21 @@ class DetectorMaskGenerator:
         self.beamstop_mask: np.ndarray | None = None
         self.final_mask: np.ndarray | None = None
         self.summary: dict[str, Any] = {}
+
+    @classmethod
+    def _normalize_parameter_names(cls, parameters: dict[str, Any]) -> dict[str, Any]:
+        """Translate old parameter names to the current class API names."""
+
+        normalized = dict(parameters)
+        for old_name, new_name in cls.LEGACY_PARAMETER_ALIASES.items():
+            if old_name not in normalized:
+                continue
+            if new_name in normalized:
+                raise ValueError(
+                    f"Use only one of {old_name!r} or {new_name!r}; {new_name!r} is preferred."
+                )
+            normalized[new_name] = normalized.pop(old_name)
+        return normalized
 
     @staticmethod
     def find_first_tiff(folder: str | Path = ".") -> Path:
@@ -196,8 +227,20 @@ class DetectorMaskGenerator:
             "log_high_percentile_value": high,
         }
 
-    def median_filter_tiled(self, array: np.ndarray, window: int, tile_rows: int) -> np.ndarray:
-        """Apply a median filter in row tiles to limit peak memory use."""
+    def median_filter_tiled(
+        self,
+        array: np.ndarray,
+        window: int | None = None,
+        tile_rows: int | None = None,
+    ) -> np.ndarray:
+        """Apply a median filter in row tiles to limit peak memory use.
+
+        If ``window`` or ``tile_rows`` is omitted, the method uses the
+        independent ``median_window`` and ``median_tile_rows`` class parameters.
+        """
+
+        window = int(self.parameters["median_window"] if window is None else window)
+        tile_rows = int(self.parameters["median_tile_rows"] if tile_rows is None else tile_rows)
 
         if window % 2 != 1 or window < 3:
             raise ValueError("window must be an odd integer >= 3")
@@ -222,27 +265,55 @@ class DetectorMaskGenerator:
     def robust_local_zscore(
         self,
         analysis_image: np.ndarray,
-        window: int,
-        tile_rows: int,
+        zscore_window: int,
+        zscore_tile_rows: int,
         sigma_floor_percentile: float,
+        use_median_filter: bool = True,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
-        """Compute local median, residual, and robust local z-score maps."""
+        """Compute residual and robust z-score maps for bad-pixel candidates.
 
-        local_median = self.median_filter_tiled(analysis_image, window, tile_rows)
-        residual = analysis_image - local_median
+        With ``use_median_filter=True``, this uses tiled local medians and local
+        MAD estimates. With ``use_median_filter=False``, it skips tiled median
+        filtering and uses one global robust median/MAD estimate for the image.
+        """
 
-        abs_residual = np.abs(residual)
-        local_mad = self.median_filter_tiled(abs_residual, window, tile_rows)
-        robust_sigma = (1.4826 * local_mad).astype(np.float32)
+        if use_median_filter:
+            local_median = self.median_filter_tiled(
+                analysis_image,
+                window=zscore_window,
+                tile_rows=zscore_tile_rows,
+            )
+            residual = analysis_image - local_median
 
-        positive_sigma = robust_sigma[np.isfinite(robust_sigma) & (robust_sigma > 0)]
-        if positive_sigma.size:
-            sigma_floor = float(np.percentile(positive_sigma, sigma_floor_percentile))
+            abs_residual = np.abs(residual)
+            local_mad = self.median_filter_tiled(
+                abs_residual,
+                window=zscore_window,
+                tile_rows=zscore_tile_rows,
+            )
+            robust_sigma = (1.4826 * local_mad).astype(np.float32)
+
+            positive_sigma = robust_sigma[np.isfinite(robust_sigma) & (robust_sigma > 0)]
+            if positive_sigma.size:
+                sigma_floor = float(np.percentile(positive_sigma, sigma_floor_percentile))
+            else:
+                sigma_floor = 1.0e-6
+            sigma_floor = max(sigma_floor, 1.0e-6)
+            zscore = residual / np.maximum(robust_sigma, sigma_floor)
         else:
-            sigma_floor = 1.0e-6
-        sigma_floor = max(sigma_floor, 1.0e-6)
+            finite = np.isfinite(analysis_image)
+            center = float(np.median(analysis_image[finite])) if finite.any() else 0.0
+            local_median = np.full_like(analysis_image, center, dtype=np.float32)
+            residual = analysis_image - local_median
 
-        zscore = residual / np.maximum(robust_sigma, sigma_floor)
+            finite_residual = residual[np.isfinite(residual)]
+            if finite_residual.size:
+                global_mad = float(np.median(np.abs(finite_residual)))
+                sigma_floor = max(1.4826 * global_mad, 1.0e-6)
+            else:
+                sigma_floor = 1.0e-6
+            zscore = residual / sigma_floor
+
         return local_median, residual.astype(np.float32), zscore.astype(np.float32), sigma_floor
 
     @staticmethod
@@ -384,6 +455,7 @@ class DetectorMaskGenerator:
     def _merged_parameters(self, overrides: dict[str, Any]) -> dict[str, Any]:
         """Combine initialization defaults with per-call parameter overrides."""
 
+        overrides = self._normalize_parameter_names(overrides)
         unknown = sorted(set(overrides) - set(self.DEFAULTS))
         if unknown:
             raise ValueError(f"Unknown parameter(s): {', '.join(unknown)}")
@@ -413,9 +485,10 @@ class DetectorMaskGenerator:
         )
         local_median, local_residual, local_zscore, sigma_floor = self.robust_local_zscore(
             log_normalized,
-            window=int(params["window"]),
-            tile_rows=int(params["tile_rows"]),
+            zscore_window=int(params["zscore_window"]),
+            zscore_tile_rows=int(params["zscore_tile_rows"]),
             sigma_floor_percentile=float(params["sigma_floor_percentile"]),
+            use_median_filter=bool(params["use_median_filter"]),
         )
 
         invalid_mask = ~self.finite
@@ -485,7 +558,12 @@ class DetectorMaskGenerator:
             "log_low_percentile": float(params["log_low_percentile"]),
             "log_high_percentile": float(params["log_high_percentile"]),
             **log_info,
-            "local_window": int(params["window"]),
+            "zscore_mode": "local_median_mad" if bool(params["use_median_filter"]) else "global_mad",
+            "use_median_filter": bool(params["use_median_filter"]),
+            "zscore_window": int(params["zscore_window"]),
+            "zscore_tile_rows": int(params["zscore_tile_rows"]),
+            "median_window": int(params["median_window"]),
+            "median_tile_rows": int(params["median_tile_rows"]),
             "dead_z_threshold": float(params["dead_z"]),
             "hot_z_threshold": float(params["hot_z"]),
             "sigma_floor": sigma_floor,
