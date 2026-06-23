@@ -1,0 +1,53 @@
+{
+  "application": "pyFAI-calib2",
+  "version": 5,
+  "poni": {
+    "poni_version": 2.1,
+    "dist": 0.24232857505621777,
+    "poni1": 0.20727672288626836,
+    "poni2": 0.21018251193263174,
+    "rot1": -0.004971194428735324,
+    "rot2": -0.0023604366262262645,
+    "rot3": 0.0,
+    "detector": "Detector",
+    "detector_config": {
+      "pixel1": 0.00019999999999999998,
+      "pixel2": 0.00019999999999999998,
+      "max_shape": [
+        2048,
+        2048
+      ],
+      "orientation": 3
+    },
+    "wavelength": 1.81e-11
+  },
+  "nbpt_rad": 1024,
+  "nbpt_azim": 360,
+  "unit": "2th_deg",
+  "chi_discontinuity_at_0": false,
+  "polarization_description": null,
+  "normalization_factor": 1.0,
+  "val_dummy": null,
+  "delta_dummy": null,
+  "correct_solid_angle": true,
+  "dark_current": null,
+  "flat_field": null,
+  "mask_file": null,
+  "error_model": "no",
+  "method": [
+    "bbox",
+    "histogram",
+    "cython"
+  ],
+  "opencl_device": null,
+  "azimuth_range": null,
+  "radial_range": null,
+  "integrator_class": "AzimuthalIntegrator",
+  "integrator_method": null,
+  "extra_options": null,
+  "monitor_name": null,
+  "shape": [
+    2048,
+    2048
+  ]
+}

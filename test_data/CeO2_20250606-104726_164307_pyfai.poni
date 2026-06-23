@@ -1,0 +1,14 @@
+# Nota: C-Order, 1 refers to the Y axis, 2 to the X axis
+# Calibration done on Tue Jun 23 15:51:55 2026
+poni_version: 2.1
+Detector: Detector
+Detector_config: {"pixel1": 0.00019999999999999998, "pixel2": 0.00019999999999999998, "max_shape": [2048, 2048], "orientation": 3}
+Distance: 0.24232857505621777
+Poni1: 0.20727672288626836
+Poni2: 0.21018251193263174
+Rot1: -0.004971194428735324
+Rot2: -0.0023604366262262645
+Rot3: 0.0
+Wavelength: 1.81e-11
+# Calibrant: CeO2
+# Image: fabio:///nsls2/users/clin1/Documents/Git_BNL/auto_ADmask/test_data/CeO2_20250606-104726_164307_primary-dk_sub_image-00000.tiff
